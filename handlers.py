@@ -298,7 +298,7 @@ async def escalate(message: Message, state: FSMContext, summary: str | None):
     await state.clear()
     await message.answer(
         "🙋 Тут нужен живой специалист. Я передал ему всё: что случилось и что мы пробовали. "
-        "Пересказывать ничего не надо, ответ придёт сюда."
+        "Пересказывать ничего не надо, ответ придёт вам в личные сообщения от эксперта."
     )
     await send_to_specialists(message.bot, ticket)
 
