@@ -8,96 +8,110 @@ from prompts import ANALYZE_PROMPT, NEXT_STEP_PROMPT, SPECIALIST_SUMMARY_PROMPT
 
 load_dotenv()
 
+# Клиент создаётся ОДИН раз, а не на каждый вызов
+_giga = GigaChat(
+    credentials=os.getenv("GIGACHAT_CREDENTIALS"),
+    scope="GIGACHAT_API_PERS",
+    model="GigaChat-2",
+    verify_ssl_certs=False,
+)
 
-def _get_client() -> GigaChat:
-    return GigaChat(
-        credentials=os.getenv("GIGACHAT_CREDENTIALS"),
-        scope="GIGACHAT_API_PERS",
-        model="GigaChat-2",
-        verify_ssl_certs=False,
-    )
+DEFAULTS = {
+    "problem_summary": "",
+    "service": "не определено",
+    "urgency": "medium",
+    "known_facts": [],
+    "missing_info": [],
+    "next_question": None,
+    "next_step": None,
+    "step_number": 0,
+    "total_steps_estimate": 0,
+    "status": "escalate",
+    "specialist_summary": None,
+}
 
 
-def _clean_json(raw: str) -> str:
-    raw = raw.strip()
-    if raw.startswith("```json"):
-        raw = raw[7:]
-    elif raw.startswith("```"):
-        raw = raw[3:]
-    if raw.endswith("```"):
-        raw = raw[:-3]
-    return raw.strip()
+async def _ask(system: str, user: str, temperature: float = 0.2) -> str:
+    resp = await _giga.achat(Chat(
+        messages=[
+            Messages(role=MessagesRole.SYSTEM, content=system),
+            Messages(role=MessagesRole.USER, content=user),
+        ],
+        temperature=temperature,
+    ))
+    return resp.choices[0].message.content
+
+
+def _extract_json(raw: str) -> str:
+    start, end = raw.find("{"), raw.rfind("}")
+    return raw[start:end + 1] if start != -1 and end != -1 else raw
 
 
 def _safe_fallback(user_text: str, reason: str) -> dict:
     return {
+        **DEFAULTS,
         "problem_summary": user_text[:200],
-        "service": "не определено",
-        "urgency": "medium",
-        "known_facts": [],
-        "missing_info": [],
-        "next_question": None,
-        "next_step": None,
-        "step_number": 0,
-        "total_steps_estimate": 0,
         "status": "escalate",
         "specialist_summary": f"{reason}. Исходный текст: {user_text[:300]}",
     }
 
 
-def analyze(user_text: str) -> dict:
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=ANALYZE_PROMPT),
-        Messages(role=MessagesRole.USER, content=user_text),
-    ]
+async def analyze(original: str, qa: list[dict] | None = None) -> dict:
+    """
+    original — первое сообщение юзера
+    qa — история уточнений: [{"q": "вопрос бота", "a": "ответ юзера"}, ...]
+    """
+    context = f"Исходное обращение: {original}\n"
+    for item in qa or []:
+        context += f"Вопрос: {item['q']}\nОтвет пользователя: {item['a']}\n"
 
-    try:
-        with _get_client() as giga:
-            response = giga.chat(Chat(messages=messages))
-            raw = response.choices[0].message.content
-            cleaned = _clean_json(raw)
-            return json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        print(f"[ai.analyze] JSON decode error: {e}")
-        return _safe_fallback(user_text, "AI вернул не JSON")
-    except Exception as e:
-        print(f"[ai.analyze] Ошибка: {e}")
-        return _safe_fallback(user_text, f"Ошибка AI: {type(e).__name__}")
+    for _ in range(2):  # один ретрай перед эскалацией
+        try:
+            raw = await _ask(ANALYZE_PROMPT, context)
+            return {**DEFAULTS, **json.loads(_extract_json(raw))}
+        except Exception as e:
+            print(f"[ai.analyze] {type(e).__name__}: {e}")
+    return _safe_fallback(original, "AI не вернул валидный JSON")
 
 
-def next_step(ticket: dict) -> dict:
+async def next_step(ticket: dict) -> dict:
     problem = ticket.get("problem_statement", "")
     steps_tried = ticket.get("steps_tried", [])
     current_step = ticket.get("step_number", 1)
 
-    context = f"problem_statement: {problem}\n"
-    context += f"steps_tried: {json.dumps(steps_tried, ensure_ascii=False)}\n"
-    context += f"current_step: {current_step}\n"
-    context += "Предложи следующий шаг."
-
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=NEXT_STEP_PROMPT),
-        Messages(role=MessagesRole.USER, content=context),
-    ]
-
-    try:
-        with _get_client() as giga:
-            response = giga.chat(Chat(messages=messages))
-            raw = response.choices[0].message.content
-            cleaned = _clean_json(raw)
-            return json.loads(cleaned)
-    except Exception as e:
-        print(f"[ai.next_step] Ошибка: {e}")
+    # Жёсткий лимит в коде, а не только в промпте
+    if current_step >= 4:
         return {
             "next_step": None,
             "step_number": current_step,
-            "total_steps_estimate": 0,
+            "total_steps_estimate": 4,
             "status": "escalate",
-            "specialist_summary": f"AI не смог предложить шаг. Проблема: {problem[:200]}",
+            "specialist_summary": None,
         }
 
+    context = (
+        f"problem_statement: {problem}\n"
+        f"steps_tried: {json.dumps(steps_tried, ensure_ascii=False)}\n"
+        f"current_step: {current_step}\n"
+        "Предложи следующий шаг."
+    )
 
-def specialist_summary(ticket: dict) -> str:
+    for _ in range(2):
+        try:
+            raw = await _ask(NEXT_STEP_PROMPT, context)
+            return json.loads(_extract_json(raw))
+        except Exception as e:
+            print(f"[ai.next_step] {type(e).__name__}: {e}")
+    return {
+        "next_step": None,
+        "step_number": current_step,
+        "total_steps_estimate": 0,
+        "status": "escalate",
+        "specialist_summary": f"AI не смог предложить шаг. Проблема: {problem[:200]}",
+    }
+
+
+async def specialist_summary(ticket: dict) -> str:
     original = ticket.get("original_message", "")
     problem = ticket.get("problem_statement", "")
     steps_tried = ticket.get("steps_tried", [])
@@ -114,15 +128,8 @@ def specialist_summary(ticket: dict) -> str:
         f"Срочность: {urgency}"
     )
 
-    messages = [
-        Messages(role=MessagesRole.SYSTEM, content=SPECIALIST_SUMMARY_PROMPT),
-        Messages(role=MessagesRole.USER, content=context),
-    ]
-
     try:
-        with _get_client() as giga:
-            response = giga.chat(Chat(messages=messages))
-            return response.choices[0].message.content.strip()
+        return (await _ask(SPECIALIST_SUMMARY_PROMPT, context)).strip()
     except Exception as e:
-        print(f"[ai.specialist_summary] Ошибка: {e}")
+        print(f"[ai.specialist_summary] {type(e).__name__}: {e}")
         return f"Срочность: {urgency}. Проблема: {problem[:200]}. Пробовали: {steps_text}"
